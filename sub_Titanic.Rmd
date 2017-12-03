@@ -1,0 +1,249 @@
+---
+title: "Titanic_Survival_Prediction"
+output:
+  html_document: default
+  pdf_document: default
+authors: Rotem Shperling & Eitan Shteinberg
+---
+
+```{r}
+setwd("~/R/A2")
+```
+
+*Loading the libraries*
+
+```{r}
+### Installation of packages ###
+# install.packages("plyr")
+# install.packages("dplyr")
+# install.packages("ggplot2")
+# install.packages("ROCR")
+# install.packages("caretEnsemble")
+# install.packages("rattle")
+```
+
+
+```{r}
+### Loading relevant libraries ###
+library(randomForest)
+library(party)
+library(caret)
+library(plyr)
+library(dplyr)
+library(ggplot2)
+library(ROCR)
+library(caretEnsemble)
+```
+*Loading the data from the files*
+
+```{r}
+### Loading the data from the files ###
+train <- read.csv("Titanic/train.csv")
+test  <- read.csv("Titanic/test.csv")
+
+### Setting the seed ###
+seed <- 415
+```
+
+```{r}
+### Binding the datasets ###
+test$Survived <- NA # Creating the test NA column for future prediction
+full <- rbind(train, test) # Binding to a full dataset
+```
+
+
+*Feature Engineering*
+
+```{r}
+### Title ###
+full$Name <- as.character(full$Name) # Transforming to string
+full$Title <- gsub('(.*, )|(\\..*)', '', full$Name) # Getting the name using regular expressions
+str(factor(full$Title)) # Finding the number of levels
+other <- c('Dona', 'Lady', 'the Countess','Capt', 'Col', 'Don', 'Dr', 'Major', 'Rev', 'Sir', 'Jonkheer') # Other rare titles
+full$Title[full$Title == 'Mlle']  <- 'Miss' 
+full$Title[full$Title == 'Ms']  <- 'Miss'
+full$Title[full$Title == 'Mme'] <- 'Mrs' 
+full$Title[full$Title %in% other] <- 'Other'
+full$Title <- factor(full$Title)  # Factoring the variable
+```
+
+```{r}
+### Family Size ###
+full$FamilySize <- full$SibSp + full$Parch + 1 # Creating the Family size variable - self + parents/children + siblings
+
+### Family Size Labeling - Family ID ###
+full$Surname <- sapply(full$Name, FUN=function(x) {strsplit(x, split='[,.]')[[1]][1]}) # Getting the surname of the record
+full$FamilyID <- paste(as.character(full$FamilySize), full$Surname, sep="") # Pasting the surname to the size of the family
+full$FamilyID[full$FamilySize <= 2] <- 'Small' # Families smaller than 2 individuals labeled as Small
+
+# Delete erroneous family IDs
+famIDs <- data.frame(table(full$FamilyID))
+famIDs <- famIDs[famIDs$Freq <= 2,]
+full$FamilyID[full$FamilyID %in% famIDs$Var1] <- 'Small'
+full$FamilyID <- factor(full$FamilyID)
+```
+
+```{r}
+### Age ###
+set.seed(seed)
+sum(is.na(full$Age)) # How many missing values are there in the Age column
+age_avg <- round(mean(full$Age, na.rm = TRUE)) # Gets the average age
+age_std <- round(sd(full$Age, na.rm = TRUE)) # Gets the standard deviation of the age
+null_count <- sum(is.na(full$Age)) # Gets the number of missing values after filling them
+age_rand <- sample((age_avg - age_std):(age_avg + age_std), null_count, replace = TRUE) # Creates a random list of ages withing the range of 1 std from the mean
+full$Age <- ifelse(!is.na(full$Age), full$Age, age_rand) # Replaces the values with the random age list
+sum(is.na(full$Age))
+```
+
+```{r}
+### Embarked ###
+summary(full$Embarked) # Searching for missing values
+which(full$Embarked == "") # Get the index of the missing Embarked values
+full[which(full$PassengerId==62),] # Get the row data of passenger 62
+full[which(full$PassengerId==830),] # Get the row data of passenger 830
+age_mean = ((full$Fare[62] + full$Fare[830]) / 2) # Get the mean age of the two passengers
+embark_fare <- full %>% filter(PassengerId != 62 & PassengerId != 830) # Get the data of all the other passengers
+ggplot(embark_fare, aes(x = Embarked, y = Fare, fill = factor(Pclass))) +
+  geom_boxplot() + geom_hline(aes(yintercept=age_mean), colour='yellow', linetype='solid', lwd=1) # Plots a graph of the Fare by the Pclass & Embarked
+full$Embarked[c(62,830)] = "C" # As a result of the graph - Gets 'C'
+```
+
+```{r}
+### Fare ###
+summary(full$Fare) # Search for missing values
+which(is.na(full$Fare)) # Get the index of the missing values
+full[which(full$PassengerId==1044),] # Get the data of the passenger (id 1044)
+med_fare <- median(full[full$Pclass == '3' & full$Embarked == 'S', ]$Fare, na.rm = TRUE) # Calculate the median fare of passengers in class 3 & embarked from S
+med_fare
+full$Fare[1044] <- med_fare # Insert the value to the passenger
+```
+```{r}
+### Trying to figure out the connection between survival, fare, pclass & sex ###
+qplot(Age, Fare, data=train, colour=as.factor(Pclass), facets=~Sex+Survived, na.rm=TRUE)
+```
+
+```{r}
+### High Society - new feature, people who paid more than 79.60 survived more than the rest ###
+full$HighSociety <- 0
+full$HighSociety[full$Fare >= 79.65] <- 1
+```
+
+```{r}
+### Factoring Variables ###
+full$Pclass <- factor(full$Pclass)
+full$Embarked <- factor(full$Embarked)
+full$HighSociety <- factor(full$HighSociety)
+```
+
+*Preperation for the ML modelling*
+
+```{r}
+### Splitting to train/test again ###
+str(full) # Double check no data is missing & everything categorical is factorized
+train <- full[1:891,]
+test <- full[892:1309,]
+write.csv(full, file = "full.csv", row.names = FALSE) # Get the .csv file of the full dataset
+```
+
+*Ensemble Modelling*
+```{r}
+### Ensemble preperation - Change binary values to yes/no ###
+train$Survived <- factor(train$Survived, levels=c(0,1), labels=c("No", "Yes"))
+train$HighSociety <- factor(train$HighSociety, levels=c(0,1), labels=c("No", "Yes"))
+test$HighSociety <- factor(test$HighSociety, levels=c(0,1), labels=c("No", "Yes"))
+```
+
+```{r}
+### Creating ensemble models ###
+suppressMessages(library("caret")) # Suppressing warning messages
+control <- trainControl(method="repeatedcv", number=5, repeats=3, savePredictions='final', classProbs=TRUE) # Control of the models
+algorithmList <- c('knn', 'xgbTree','cforest', 'C5.0', 'LogitBoost') # Listing the models to test
+models <- caretList(as.factor(Survived) ~  Pclass + Sex + Age + Fare + Title + FamilySize + FamilyID + HighSociety, data=train, 
+                    trControl=control, methodList=algorithmList) # Initiating the model
+```
+
+```{r}
+### Displaying ensemble results & plot of the accuracy & Kappa ###
+results <- resamples(models)
+summary(results)
+dotplot(results)
+```
+
+```{r}
+### Displaying the greedy optimization summary ###
+greedy_ensemble <- caretEnsemble(models)
+summary(greedy_ensemble)
+```
+*Hands-On Modelling using Caret & other packages*
+```{r}
+### Splitting to train/test again ###
+train <- full[1:891,]
+test <- full[892:1309,]
+```
+
+```{r}
+### Control & Metric for some of the models ###
+control <- trainControl(method="cv", number=5) # Cross Validation = 5
+metric <- "Accuracy" # Metric methoc
+```
+
+```{r}
+######## C5.0 | Accuracy = 0.78947
+grid <- expand.grid(.winnow = c(TRUE,FALSE),.trials=5, .model='tree') # Trying with winnowing & without
+set.seed(seed)
+fit.c50 <- train(as.factor(Survived) ~ Pclass + Sex + Age + Fare + Title + FamilySize + FamilyID + HighSociety, data=train, method="C5.0", trControl=control,tuneGrid =grid)
+summary(fit.c50) # Get the summary
+plot(fit.c50) # With Winnowing
+Prediction <- predict( fit.c50, test) # Predict the survival results
+submit <- data.frame(PassengerId = test$PassengerId, Survived = Prediction) # Creating the submittion data frame
+write.csv(submit, file = "sub_c50.csv", row.names = FALSE)
+```
+
+```{r}
+######## XGB | Accuracy = 0.76555
+grid <- expand.grid(.nrounds=20,.max_depth=6,.eta=c(0.1,0.3,0.5),.gamma=0.1,.colsample_bytree=0.5,.min_child_weight=0.01,.subsample=0.7) # Trying 3 types of shrinkage
+set.seed(seed)
+fit.xgb <- train(as.factor(Survived) ~ Pclass + Sex + Age + Fare + Title + FamilySize + FamilyID + HighSociety, data=train, method="xgbTree", trControl=control, verbose=FALSE,tuneGrid =grid, savePredictions='final')
+summary(fit.xgb) # Get the summary
+plot(fit.xgb) # 0.3 Shrinkage
+Prediction <- predict(fit.xgb, test) # Predict the survival results
+submit <- data.frame(PassengerId = test$PassengerId, Survived = Prediction) # Creating the submittion data frame
+write.csv(submit, file = "sub_xgb.csv", row.names = FALSE)
+```
+
+```{r}
+######## Condition inference tree Random Forest | Accuracy = 0.80861
+set.seed(seed)
+fit.cforest <- cforest(as.factor(Survived) ~  Pclass + Sex + Age + Fare + Title + FamilySize + FamilyID + HighSociety, data = train, controls=cforest_unbiased(ntree=2000, mtry=2))
+Prediction <- predict(fit.cforest, test, OOB=TRUE, type = "response") # Predict the survival results
+varImp(fit.cforest) # Get the variable importnace
+submit <- data.frame(PassengerId = test$PassengerId, Survived = Prediction) # Creating the submittion data frame
+write.csv(submit, file = "sub_cforest.csv", row.names = FALSE)
+```
+
+```{r}
+######## KNN - Excluding FamilyID | Accuracy = 0.76555
+trctrl <- trainControl(method = "repeatedcv", number = 10, repeats = 3) # Train control with cross validation
+set.seed(seed)
+knn_fit <- train(as.factor(Survived) ~ Pclass + Sex + Age + Fare + Title + FamilySize + HighSociety, data = train, method = "knn",
+                 trControl=trctrl,
+                 preProcess = c("center", "scale"),
+                 tuneLength = 10)
+knn_fit # Get the details
+plot(knn_fit) # K=5 is the best by the model summary
+Prediction <- predict(knn_fit, newdata = test, k=5) # Predict the survival results
+submit <- data.frame(PassengerId = test$PassengerId, Survived = Prediction) # Creating the submittion data frame
+write.csv(submit, file = "sub_knn.csv", row.names = FALSE)
+```
+
+```{r}
+################# LR - Excluding FamilyID | Accuracy = 0.77990
+set.seed(seed)
+mod_fit_one <- glm(as.factor(Survived) ~  Pclass + Sex + Age + Fare + Title + FamilySize + HighSociety, data=train, family="binomial"(link='logit'))
+summary(mod_fit_one) # estimates
+plot(mod_fit_one) # Plots the different information types
+Prediction <- predict(mod_fit_one, newdata=test, type="response") # Predict the probabilities
+Prediction <- round(Prediction) # Rounding the probabilities to 1 or 0
+submit <- data.frame(PassengerId = test$PassengerId, Survived = Prediction) # Creating the submittion data frame
+write.csv(submit, file = "sub_logreg.csv", row.names = FALSE)
+```

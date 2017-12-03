@@ -1,0 +1,7 @@
+Data Science assignment - Titanic survival prediction
+
+Link to the GitHub account: https://github.com/EitanSht/Data_Science
+
+Names: 
+		Rotem Shperling - 305699514
+		Eitan Shteinberg - 305809535
